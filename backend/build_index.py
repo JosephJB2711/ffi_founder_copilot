@@ -1,91 +1,108 @@
 import os
 import uuid
+import hashlib
 import requests
 import chromadb
 import pdfplumber
 from docx import Document
+from typing import Optional
 
-# Ordner mit deinen FFI-Texten (Playbooks, Leitfäden, Event-Docs, etc.)
-DATA_DIR = "data"
+# ─────────────────────────────
+# CONFIG
+# ─────────────────────────────
 
-# Ordner für die Vektordatenbank (muss zu main.py passen)
-DB_DIR = "chroma_db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Embedding-Setup (muss zu main.py passen)
+DATA_DIR = os.path.join(BASE_DIR, "data")
+DB_DIR = os.path.join(BASE_DIR, "chroma_db")
+
+COLLECTION_NAME = "ffi_founder_docs"
+
 EMBEDDING_MODEL = "nomic-embed-text"
 OLLAMA_EMBED_URL = "http://localhost:11434/api/embeddings"
 
-# Chroma-Client + Collection (Name muss zu main.py passen!)
+# Chunking
+MAX_CHARS = 1200
+OVERLAP = 150
+
+# Rebuild behaviour
+# True = Collection wird gelöscht und komplett neu aufgebaut (empfohlen nach großen Änderungen)
+REBUILD_COLLECTION = False
+
+
+# ─────────────────────────────
+# CHROMA INIT
+# ─────────────────────────────
+
 client = chromadb.PersistentClient(path=DB_DIR)
-collection = client.get_or_create_collection("ffi_founder_docs")
+
+if REBUILD_COLLECTION:
+    try:
+        client.delete_collection(COLLECTION_NAME)
+        print(f"🧹 Collection '{COLLECTION_NAME}' gelöscht (REBUILD_COLLECTION=True).")
+    except Exception:
+        pass
+
+collection = client.get_or_create_collection(COLLECTION_NAME)
 
 
 # ─────────────────────────────
-# TEXT-EXTRAKTION
+# HELPERS
 # ─────────────────────────────
 
-def extract_txt(path: str) -> str:
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+def classify_doc_type(filename: str) -> str:
+    fn = filename.lower()
+    if "satzung" in fn:
+        return "satzung"
+    if "datenschutz" in fn:
+        return "datenschutz"
+    if "event" in fn or "terms" in fn:
+        return "event_terms"
+    if "spons" in fn or "partner" in fn:
+        return "sponsoring"
+    return "other"
 
 
-def extract_pdf(path: str) -> str:
-    text = ""
-    with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            content = page.extract_text()
-            if content:
-                text += content + "\n"
-    return text
-
-
-def extract_docx(path: str) -> str:
-    doc = Document(path)
-    return "\n".join(p.text for p in doc.paragraphs)
-
-
-def extract_file(path: str) -> str:
-    path_lower = path.lower()
-
-    if path_lower.endswith(".txt") or path_lower.endswith(".md"):
-        return extract_txt(path)
-
-    if path_lower.endswith(".pdf"):
-        return extract_pdf(path)
-
-    if path_lower.endswith(".docx"):
-        return extract_docx(path)
-
-    raise ValueError(f"Unsupported file type: {path}")
-
-
-# ─────────────────────────────
-# CHUNKING
-# ─────────────────────────────
-
-def chunk_text(text: str, max_chars: int = 800, overlap: int = 150):
+def stable_id(source: str, page: Optional[int], chunk_idx: int, text: str) -> str:
     """
-    Zerlegt längere Texte in überlappende Chunks,
-    damit die Embeddings nicht zu lang werden.
+    Deterministische ID, damit Re-Index ohne REBUILD nicht tausend Duplikate erzeugt.
     """
-    chunks = []
-    start = 0
+    key = f"{source}|{page or 0}|{chunk_idx}|{text}".encode("utf-8", errors="ignore")
+    return hashlib.sha256(key).hexdigest()
 
-    while start < len(text):
-        end = min(len(text), start + max_chars)
-        chunk = text[start:end].strip()
-        if chunk:
-            chunks.append(chunk)
-        if end == len(text):
-            break
-        start = end - overlap
+
+def chunk_text(text: str, max_chars: int = MAX_CHARS, overlap: int = OVERLAP) -> list[str]:
+    """
+    Absatzbasiertes Chunking + Overlap.
+    """
+    paras = [p.strip() for p in text.split("\n") if p.strip()]
+    chunks: list[str] = []
+    cur = ""
+
+    for p in paras:
+        if len(cur) + len(p) + 1 <= max_chars:
+            cur = (cur + "\n" + p).strip()
+        else:
+            if cur:
+                chunks.append(cur)
+            cur = p
+
+    if cur:
+        chunks.append(cur)
+
+    if overlap and len(chunks) > 1:
+        overlapped: list[str] = []
+        for i, ch in enumerate(chunks):
+            if i == 0:
+                overlapped.append(ch)
+            else:
+                prev = chunks[i - 1]
+                prefix = prev[-overlap:] if len(prev) > overlap else prev
+                overlapped.append((prefix + "\n" + ch).strip())
+        chunks = overlapped
 
     return chunks
 
-
-# ─────────────────────────────
-# EMBEDDING VIA OLLAMA
-# ─────────────────────────────
 
 def get_embedding(text: str) -> list[float]:
     resp = requests.post(
@@ -98,7 +115,40 @@ def get_embedding(text: str) -> list[float]:
 
 
 # ─────────────────────────────
-# INDEXIERUNG
+# TEXT EXTRACTION
+# ─────────────────────────────
+
+def extract_txt(path: str) -> str:
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+
+def extract_docx(path: str) -> str:
+    doc = Document(path)
+    return "\n".join(p.text for p in doc.paragraphs if p.text and p.text.strip())
+
+
+def extract_pdf_pages(path: str) -> list[tuple[int, str]]:
+    pages: list[tuple[int, str]] = []
+    with pdfplumber.open(path) as pdf:
+        for idx, page in enumerate(pdf.pages, start=1):
+            content = (page.extract_text() or "").strip()
+            if content:
+                pages.append((idx, content))
+    return pages
+
+
+def extract_plain_text_file(path: str) -> str:
+    path_lower = path.lower()
+    if path_lower.endswith((".txt", ".md")):
+        return extract_txt(path)
+    if path_lower.endswith(".docx"):
+        return extract_docx(path)
+    raise ValueError(f"Unsupported file type for plain extraction: {path}")
+
+
+# ─────────────────────────────
+# INDEXING
 # ─────────────────────────────
 
 def index_documents():
@@ -113,39 +163,94 @@ def index_documents():
         print("Keine unterstützten Dateien in ./data gefunden.")
         return
 
+    total_added = 0
+
     for filename in files:
         full_path = os.path.join(DATA_DIR, filename)
+        doc_type = classify_doc_type(filename)
 
-        print(f"\n📄 Lese Datei: {filename} ...")
-        text = extract_file(full_path)
+        print(f"\n📄 Lese Datei: {filename} ({doc_type}) ...")
 
-        chunks = chunk_text(text)
-        print(f" → {len(chunks)} Chunks erzeugt.")
+        ids: list[str] = []
+        docs: list[str] = []
+        metas: list[dict] = []
+        embeds: list[list[float]] = []
 
-        ids = []
-        docs = []
-        metas = []
-        embeds = []
+        if filename.lower().endswith(".pdf"):
+            pages = extract_pdf_pages(full_path)
+            if not pages:
+                print(" → Keine extrahierbaren Textseiten gefunden (PDF evtl. gescannt).")
+                continue
 
-        for i, chunk in enumerate(chunks):
-            emb = get_embedding(chunk)
-            chunk_id = str(uuid.uuid4())
+            chunks_all: list[tuple[int, int, str]] = []  # (page_no, chunk_idx, chunk_text)
+            for page_no, page_text in pages:
+                page_chunks = chunk_text(page_text)
+                for chunk_idx, chunk in enumerate(page_chunks):
+                    chunks_all.append((page_no, chunk_idx, chunk))
 
-            ids.append(chunk_id)
-            docs.append(chunk)
-            metas.append({"source": filename, "chunk": i})
-            embeds.append(emb)
+            print(f" → {len(chunks_all)} Chunks erzeugt (seitenbasiert).")
 
-        collection.add(
-            ids=ids,
-            embeddings=embeds,
-            documents=docs,
-            metadatas=metas,
-        )
+            for page_no, chunk_idx, chunk in chunks_all:
+                try:
+                    emb = get_embedding(chunk)
+                except Exception as e:
+                    print(f" ! Embedding-Fehler in {filename} p.{page_no} chunk {chunk_idx}: {e}")
+                    continue
 
-        print(f" ✔ Indexiert: {filename}")
+                _id = stable_id(filename, page_no, chunk_idx, chunk)
 
-    print("\n🎉 Fertig! Alle Dokumente wurden indexiert.\n")
+                ids.append(_id)
+                docs.append(chunk)
+                metas.append({
+                    "source": filename,
+                    "doc_type": doc_type,
+                    "page": page_no,
+                    "chunk": chunk_idx,
+                })
+                embeds.append(emb)
+
+        else:
+            text = extract_plain_text_file(full_path).strip()
+            if not text:
+                print(" → Datei ist leer oder nicht extrahierbar.")
+                continue
+
+            chunks = chunk_text(text)
+            print(f" → {len(chunks)} Chunks erzeugt.")
+
+            for chunk_idx, chunk in enumerate(chunks):
+                try:
+                    emb = get_embedding(chunk)
+                except Exception as e:
+                    print(f" ! Embedding-Fehler in {filename} chunk {chunk_idx}: {e}")
+                    continue
+
+                _id = stable_id(filename, None, chunk_idx, chunk)
+
+                ids.append(_id)
+                docs.append(chunk)
+                metas.append({
+                    "source": filename,
+                    "doc_type": doc_type,
+                    "chunk": chunk_idx,
+                })
+                embeds.append(emb)
+
+        if not ids:
+            print(" → Nichts zum Hinzufügen.")
+            continue
+
+        # Hinweis: Chroma wirft bei Duplicate IDs i.d.R. Fehler.
+        # Deshalb sind deterministische IDs hier Absicherung.
+        try:
+            collection.add(ids=ids, embeddings=embeds, documents=docs, metadatas=metas)
+            total_added += len(ids)
+            print(f" ✔ Indexiert: {filename} (+{len(ids)})")
+        except Exception as e:
+            print(f" ! Fehler beim Hinzufügen in Chroma ({filename}): {e}")
+
+    print(f"\n🎉 Fertig! Insgesamt hinzugefügt: {total_added} Chunks.")
+    print("CHROMA COUNT:", collection.count())
 
 
 if __name__ == "__main__":
