@@ -8,7 +8,6 @@ from uuid import uuid4
 import requests
 import chromadb
 import os
-
 from session_store import (
     init_db,
     touch_session,
